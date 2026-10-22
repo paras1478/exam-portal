@@ -1,0 +1,393 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  STUDENT
+  FACULTY
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+/// Exam lifecycle. Allowed transitions are enforced by services/examWorkflow.ts.
+enum ExamStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  PUBLISHED
+  CANCELLED
+  ARCHIVED
+}
+
+/// When students may see their score and the correct answers.
+enum ResultRelease {
+  IMMEDIATE // as soon as the attempt is fully graded
+  AFTER_END // once the exam window has closed
+  MANUAL // only after results are explicitly published
+}
+
+enum QuestionType {
+  MCQ
+  MULTI_SELECT
+  TRUE_FALSE
+  DESCRIPTIVE
+}
+
+enum AttemptStatus {
+  IN_PROGRESS
+  SUBMITTED
+}
+
+enum SubmissionType {
+  MANUAL
+  AUTO_TIMEOUT
+}
+
+enum ResultStatus {
+  PENDING_REVIEW
+  GRADED
+}
+
+enum NotificationType {
+  INFO
+  EXAM
+  RESULT
+  ANNOUNCEMENT
+  ACCOUNT
+}
+
+enum AuditOutcome {
+  SUCCESS
+  FAILURE
+  DENIED
+}
+
+enum AnnouncementAudience {
+  ALL
+  STUDENT
+  FACULTY
+}
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String
+  name         String
+  role         Role       @default(STUDENT)
+  status       UserStatus @default(ACTIVE)
+  /// Incremented to revoke every existing session (deactivation, role change, password change, deletion).
+  tokenVersion Int        @default(0)
+  /// Soft deletion under the retention policy: records are kept, the account can no longer be used.
+  deletedAt    DateTime?
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  studentProfile       StudentProfile?
+  facultyProfile       FacultyProfile?
+  examsCreated         Exam[]             @relation("ExamCreator")
+  examsApproved        Exam[]             @relation("ExamApprover")
+  attempts             ExamAttempt[]
+  results              Result[]
+  resultsPublished     Result[]           @relation("ResultPublisher")
+  notifications        Notification[]
+  auditLogs            AuditLog[]
+  gradedAnswers        SubmittedAnswer[]  @relation("AnswerGrader")
+  examStatusChanges    ExamStatusChange[]
+  resultRevisions      ResultRevision[]
+  announcements        Announcement[]
+  settingsUpdated      SystemSetting[]
+
+  @@index([role, status])
+  @@index([createdAt])
+}
+
+model StudentProfile {
+  id         String   @id @default(uuid())
+  userId     String   @unique
+  rollNumber String?  @unique
+  department String?
+  year       Int?
+  phone      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model FacultyProfile {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  employeeId  String?  @unique
+  department  String?
+  designation String?
+  phone       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Exam {
+  id                     String        @id @default(uuid())
+  title                  String
+  description            String?
+  subject                String
+  instructions           String?
+  durationMinutes        Int
+  /// Sum of question marks; maintained by the server whenever questions change.
+  totalMarks             Float         @default(0)
+  passMarks              Float
+  negativeMarking        Boolean       @default(false)
+  /// Fraction of a question's marks deducted for a wrong objective answer (e.g. 0.25).
+  negativeMarkRatio      Float         @default(0)
+  maxAttempts            Int           @default(1)
+  startsAt               DateTime
+  endsAt                 DateTime
+  status                 ExamStatus    @default(DRAFT)
+  resultRelease          ResultRelease @default(AFTER_END)
+  resultsPublishedAt     DateTime?
+  publishedAt            DateTime?
+  submittedForApprovalAt DateTime?
+  approvedAt             DateTime?
+  approvedById           String?
+  /// Reason given by the reviewer for the latest rejection or cancellation.
+  reviewNote             String?
+  cancelledAt            DateTime?
+  createdById            String
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+
+  createdBy     User               @relation("ExamCreator", fields: [createdById], references: [id])
+  approvedBy    User?              @relation("ExamApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  questions     Question[]
+  attempts      ExamAttempt[]
+  results       Result[]
+  statusChanges ExamStatusChange[]
+
+  @@index([status, startsAt, endsAt])
+  @@index([createdById])
+  @@index([subject])
+}
+
+/// Immutable history of every exam workflow transition, with the decision reason.
+model ExamStatusChange {
+  id         String     @id @default(uuid())
+  examId     String
+  fromStatus ExamStatus
+  toStatus   ExamStatus
+  action     String
+  reason     String?
+  actorId    String?
+  createdAt  DateTime   @default(now())
+
+  exam  Exam  @relation(fields: [examId], references: [id], onDelete: Cascade)
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([examId, createdAt])
+}
+
+model Question {
+  id          String       @id @default(uuid())
+  examId      String
+  type        QuestionType
+  text        String
+  marks       Float
+  order       Int
+  explanation String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  exam    Exam              @relation(fields: [examId], references: [id], onDelete: Cascade)
+  options QuestionOption[]
+  answers SubmittedAnswer[]
+
+  @@index([examId, order])
+}
+
+model QuestionOption {
+  id         String  @id @default(uuid())
+  questionId String
+  text       String
+  isCorrect  Boolean @default(false)
+  order      Int
+
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([questionId, order])
+}
+
+model ExamAttempt {
+  id             String          @id @default(uuid())
+  examId         String
+  studentId      String
+  attemptNumber  Int
+  status         AttemptStatus   @default(IN_PROGRESS)
+  startedAt      DateTime        @default(now())
+  /// Authoritative deadline computed by the server: min(startedAt + duration, exam.endsAt).
+  deadlineAt     DateTime
+  submittedAt    DateTime?
+  submissionType SubmissionType?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  exam    Exam              @relation(fields: [examId], references: [id], onDelete: Cascade)
+  student User              @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  answers SubmittedAnswer[]
+  result  Result?
+
+  @@unique([examId, studentId, attemptNumber])
+  @@index([studentId, status])
+  @@index([status, deadlineAt])
+}
+
+model SubmittedAnswer {
+  id                String    @id @default(uuid())
+  attemptId         String
+  questionId        String
+  selectedOptionIds String[]  @default([])
+  textAnswer        String?
+  markedForReview   Boolean   @default(false)
+  /// Set by the grader (automatic for objective questions, faculty for descriptive).
+  marksAwarded      Float?
+  isCorrect         Boolean?
+  feedback          String?
+  /// Marks set by an authorised correction; takes precedence over automatic grading.
+  overrideMarks     Float?
+  gradedById        String?
+  gradedAt          DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  attempt  ExamAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  question Question    @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  gradedBy User?       @relation("AnswerGrader", fields: [gradedById], references: [id], onDelete: SetNull)
+
+  @@unique([attemptId, questionId])
+}
+
+model Result {
+  id                 String       @id @default(uuid())
+  attemptId          String       @unique
+  examId             String
+  studentId          String
+  objectiveScore     Float        @default(0)
+  descriptiveScore   Float        @default(0)
+  totalScore         Float        @default(0)
+  maxScore           Float
+  percentage         Float        @default(0)
+  passed             Boolean      @default(false)
+  correctCount       Int          @default(0)
+  incorrectCount     Int          @default(0)
+  unansweredCount    Int          @default(0)
+  pendingReviewCount Int          @default(0)
+  status             ResultStatus @default(GRADED)
+  gradedAt           DateTime?
+  /// Individual verification + publication by an authorised user.
+  publishedAt        DateTime?
+  publishedById      String?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  attempt     ExamAttempt      @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  exam        Exam             @relation(fields: [examId], references: [id], onDelete: Cascade)
+  student     User             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  publishedBy User?            @relation("ResultPublisher", fields: [publishedById], references: [id], onDelete: SetNull)
+  revisions   ResultRevision[]
+
+  @@index([examId])
+  @@index([studentId, createdAt])
+}
+
+/// Record of every manual grading or correction that changed a result.
+model ResultRevision {
+  id                 String   @id @default(uuid())
+  resultId           String
+  questionId         String?
+  kind               String // GRADE | CORRECTION
+  reason             String?
+  previousMarks      Float?
+  newMarks           Float?
+  previousTotalScore Float
+  newTotalScore      Float
+  actorId            String?
+  createdAt          DateTime @default(now())
+
+  result Result @relation(fields: [resultId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([resultId, createdAt])
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  type      NotificationType @default(INFO)
+  title     String
+  message   String
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt])
+}
+
+model Announcement {
+  id          String               @id @default(uuid())
+  title       String
+  message     String
+  audience    AnnouncementAudience
+  recipients  Int
+  createdById String?
+  createdAt   DateTime             @default(now())
+
+  createdBy User? @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+}
+
+/// Append-only (enforced by a database trigger). Never store secrets here.
+model AuditLog {
+  id         String       @id @default(uuid())
+  actorId    String?
+  /// Snapshots so the trail stays meaningful if the actor is later removed.
+  actorEmail String?
+  actorRole  Role?
+  action     String
+  outcome    AuditOutcome @default(SUCCESS)
+  entityType String
+  entityId   String?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime     @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@index([action])
+}
+
+/// Key/value system configuration. Keys and value shapes are defined in services/settings.ts.
+model SystemSetting {
+  key         String   @id
+  value       Json
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  updatedBy User? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+}
